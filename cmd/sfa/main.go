@@ -12,16 +12,25 @@ import (
 	"strings"
 )
 
-const version = "0.1.1"
+const version = "0.2.0"
+
+type RuntimeProfile struct {
+	Language  string `json:"language"`
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Version   string `json:"version"`
+	RunPrefix string `json:"run_prefix"`
+}
 
 type Config struct {
-	Alias     string `json:"alias"`
-	Host      string `json:"host"`
-	User      string `json:"user"`
-	Port      string `json:"port"`
-	RemoteDir string `json:"remote_dir"`
-	RunPrefix string `json:"run_prefix"`
-	KeyPath   string `json:"key_path"`
+	Alias     string         `json:"alias"`
+	Host      string         `json:"host"`
+	User      string         `json:"user"`
+	Port      string         `json:"port"`
+	RemoteDir string         `json:"remote_dir"`
+	RunPrefix string         `json:"run_prefix"`
+	KeyPath   string         `json:"key_path"`
+	Runtime   RuntimeProfile `json:"runtime"`
 }
 
 func main() {
@@ -47,6 +56,8 @@ func main() {
 		cleanCodeCmd()
 	case "destroy":
 		destroyCmd()
+	case "env":
+		envCmd(os.Args[2:])
 	case "doctor":
 		doctorCmd()
 	case "version":
@@ -74,6 +85,18 @@ Usage:
   sfa pull
   sfa clean-code
   sfa destroy
+
+  sfa env detect
+  sfa env show
+  sfa env set python conda ENV_NAME
+  sfa env set go system
+  sfa env set node system
+  sfa env set rust system
+  sfa env set dotnet system
+  sfa env set java system
+  sfa env set-prefix "PREFIX_COMMAND"
+  sfa env clear
+
   sfa doctor
   sfa version
   sfa uninstall [--all]
@@ -203,6 +226,13 @@ func initCmd(args []string) {
 		RemoteDir: remoteDir,
 		RunPrefix: runPrefix,
 		KeyPath:   keyPath,
+		Runtime: RuntimeProfile{
+			Language:  "",
+			Kind:      "",
+			Name:      "",
+			Version:   "",
+			RunPrefix: runPrefix,
+		},
 	}
 
 	must(run("ssh", alias, "mkdir -p "+quote(remoteDir)))
@@ -323,6 +353,17 @@ Clean local and remote code/test files with:
 
 sfa clean-code
 
+## Runtime Environment
+
+Before running project commands, inspect .agent/config.json and PROJECT_CONTEXT.md for the configured runtime.
+
+If no runtime is configured:
+1. Run sfa env detect.
+2. If a suitable runtime exists, configure it with sfa env set.
+3. If no suitable runtime exists, install/create it using sfa run.
+4. Configure it with sfa env set or sfa env set-prefix.
+5. Verify with a hello world command through sfa run.
+
 After modifying code, run the appropriate remote command and verify the result.
 
 Never ask the user to paste passwords into chat.
@@ -337,6 +378,14 @@ sfa destroy deletes the current local project directory and its configured remot
 
 	must(os.WriteFile("AGENTS.md", []byte(agents), 0644))
 	must(os.WriteFile("CLAUDE.md", []byte(agents), 0644))
+	writeProjectContext(cfg)
+}
+
+func writeProjectContext(cfg Config) {
+	runtimeText := "not configured"
+	if strings.TrimSpace(cfg.Runtime.Language) != "" {
+		runtimeText = fmt.Sprintf("%s / %s / %s", cfg.Runtime.Language, cfg.Runtime.Kind, emptyText(cfg.Runtime.Name, "(none)"))
+	}
 
 	ctx := fmt.Sprintf(`# Project Context
 
@@ -348,11 +397,25 @@ Remote host:
 Remote directory:
 %s
 
+## Runtime Environment
+
+Runtime:
+%s
+
 Run prefix:
 %s
 
-Describe the project language, environment, dependencies, and common commands here.
-`, cfg.Alias, cfg.RemoteDir, emptyText(cfg.RunPrefix, "(none)"))
+All project commands should be run through:
+
+sfa run "<command>"
+
+For long jobs:
+
+sfa bg-run <job-name> "<command>"
+
+Describe the project language, dependencies, common commands, and experiment notes here.
+`, cfg.Alias, cfg.RemoteDir, runtimeText, emptyText(cfg.RunPrefix, "(none)"))
+
 	must(os.WriteFile("PROJECT_CONTEXT.md", []byte(ctx), 0644))
 }
 
@@ -441,11 +504,238 @@ func statusCmd() {
 	cfg := loadConfig()
 
 	remote := fmt.Sprintf(
-		`echo "=== HOST ==="; hostname; pwd; whoami; echo; echo "=== REMOTE DIR ==="; cd %s && pwd; echo; echo "=== BACKGROUND JOBS ==="; if [ -d pids ]; then for pidfile in pids/*.pid; do [ -e "$pidfile" ] || continue; job=$(basename "$pidfile" .pid); pid=$(cat "$pidfile"); if ps -p "$pid" >/dev/null 2>&1; then echo "RUNNING  $job  PID=$pid"; else echo "FINISHED $job  PID=$pid"; fi; done; else echo "No pids directory."; fi; echo; echo "=== REMOTE CODE MIRROR FILES ==="; find . -maxdepth 2 -type f | sort | head -100`,
+		`echo "=== HOST ==="; hostname; pwd; whoami; echo; echo "=== REMOTE DIR ==="; cd %s && pwd; echo; echo "=== BACKGROUND JOBS ==="; if [ -d pids ]; then for pidfile in pids/*.pid; do [ -e "$pidfile" ] || continue; job=$(basename "$pidfile" .pid); pid=$(cat "$pidfile"); if ps -p "$pid" >/dev/null 2>&1; then echo "RUNNING  $job  PID=$pid"; else echo "FINISHED $job  PID=$pid"; fi; done; else echo "No pids directory."; fi; echo; echo "=== RUNTIME ==="; echo %s; echo; echo "=== REMOTE CODE MIRROR FILES ==="; find . -maxdepth 2 -type f | sort | head -100`,
 		quote(cfg.RemoteDir),
+		quote(emptyText(cfg.RunPrefix, "none")),
 	)
 
 	must(run("ssh", cfg.Alias, "sh -lc "+quote(remote)))
+}
+
+func envCmd(args []string) {
+	if len(args) < 1 {
+		envUsage()
+		os.Exit(1)
+	}
+
+	switch args[0] {
+	case "detect":
+		envDetectCmd()
+	case "show":
+		envShowCmd()
+	case "set":
+		envSetCmd(args[1:])
+	case "set-prefix":
+		envSetPrefixCmd(args[1:])
+	case "clear":
+		envClearCmd()
+	default:
+		envUsage()
+		os.Exit(1)
+	}
+}
+
+func envUsage() {
+	fmt.Printf(`Usage:
+  sfa env detect
+  sfa env show
+  sfa env set python conda ENV_NAME
+  sfa env set go system
+  sfa env set node system
+  sfa env set rust system
+  sfa env set dotnet system
+  sfa env set java system
+  sfa env set-prefix "PREFIX_COMMAND"
+  sfa env clear
+`)
+}
+
+func envDetectCmd() {
+	cfg := loadConfig()
+
+	script := `
+echo "=== Python ==="
+command -v conda || true
+conda env list 2>/dev/null || true
+command -v python || true
+python --version 2>&1 || true
+command -v python3 || true
+python3 --version 2>&1 || true
+
+echo
+echo "=== Go ==="
+command -v go || true
+go version 2>&1 || true
+
+echo
+echo "=== Node.js ==="
+command -v node || true
+node -v 2>&1 || true
+command -v npm || true
+npm -v 2>&1 || true
+
+echo
+echo "=== Rust ==="
+command -v rustc || true
+rustc --version 2>&1 || true
+command -v cargo || true
+cargo --version 2>&1 || true
+
+echo
+echo "=== .NET / C# ==="
+command -v dotnet || true
+dotnet --info 2>&1 | head -80 || true
+dotnet --list-sdks 2>&1 || true
+
+echo
+echo "=== Java ==="
+command -v java || true
+java -version 2>&1 || true
+command -v javac || true
+javac -version 2>&1 || true
+
+echo
+echo "=== C/C++ ==="
+command -v gcc || true
+gcc --version 2>&1 | head -2 || true
+command -v g++ || true
+g++ --version 2>&1 | head -2 || true
+command -v cmake || true
+cmake --version 2>&1 | head -2 || true
+`
+
+	must(run("ssh", cfg.Alias, "sh -lc "+quote(script)))
+}
+
+func envShowCmd() {
+	cfg := loadConfig()
+
+	fmt.Println("Runtime configuration")
+	fmt.Println()
+	fmt.Println("Remote:", cfg.Alias+":"+cfg.RemoteDir)
+	fmt.Println("Language:", emptyText(cfg.Runtime.Language, "(not configured)"))
+	fmt.Println("Kind:", emptyText(cfg.Runtime.Kind, "(not configured)"))
+	fmt.Println("Name:", emptyText(cfg.Runtime.Name, "(not configured)"))
+	fmt.Println("Version:", emptyText(cfg.Runtime.Version, "(not configured)"))
+	fmt.Println("Run prefix:", emptyText(cfg.RunPrefix, "(none)"))
+}
+
+func envSetCmd(args []string) {
+	if len(args) < 2 {
+		envUsage()
+		os.Exit(1)
+	}
+
+	cfg := loadConfig()
+	language := strings.ToLower(args[0])
+	kind := strings.ToLower(args[1])
+
+	switch language {
+	case "python":
+		if kind != "conda" {
+			fmt.Println("Currently supported Python runtime kind: conda")
+			os.Exit(1)
+		}
+		if len(args) < 3 {
+			fmt.Println("Usage: sfa env set python conda ENV_NAME")
+			os.Exit(1)
+		}
+		envName := args[2]
+		prefix := detectCondaRunPrefix(cfg, envName)
+		cfg.RunPrefix = prefix
+		cfg.Runtime = RuntimeProfile{
+			Language:  "python",
+			Kind:      "conda",
+			Name:      envName,
+			Version:   "",
+			RunPrefix: prefix,
+		}
+
+	case "go", "node", "rust", "dotnet", "java":
+		if kind != "system" {
+			fmt.Printf("Currently supported %s runtime kind: system\n", language)
+			os.Exit(1)
+		}
+		cfg.RunPrefix = ""
+		cfg.Runtime = RuntimeProfile{
+			Language:  language,
+			Kind:      "system",
+			Name:      "",
+			Version:   "",
+			RunPrefix: "",
+		}
+
+	default:
+		fmt.Println("Unsupported language:", language)
+		envUsage()
+		os.Exit(1)
+	}
+
+	saveConfig(cfg)
+	writeProjectContext(cfg)
+
+	fmt.Println("[ok] runtime configured.")
+	envShowCmd()
+}
+
+func detectCondaRunPrefix(cfg Config, envName string) string {
+	script := `
+if command -v conda >/dev/null 2>&1; then
+  conda info --base 2>/dev/null
+fi
+`
+	out, err := output("ssh", cfg.Alias, "sh -lc "+quote(script))
+	if err != nil {
+		fmt.Print(out)
+		fmt.Println("Failed to detect conda base. Use sfa env set-prefix instead.")
+		os.Exit(1)
+	}
+
+	base := strings.TrimSpace(out)
+	if base == "" {
+		fmt.Println("Conda was not found on the remote server. Create/install conda first, or use sfa env set-prefix.")
+		os.Exit(1)
+	}
+
+	condaSH := strings.TrimRight(base, "/") + "/etc/profile.d/conda.sh"
+	return ". " + quote(condaSH) + " && conda activate " + shellToken(envName)
+}
+
+func envSetPrefixCmd(args []string) {
+	if len(args) < 1 {
+		fmt.Println(`Usage: sfa env set-prefix "PREFIX_COMMAND"`)
+		os.Exit(1)
+	}
+
+	cfg := loadConfig()
+	prefix := strings.Join(args, " ")
+
+	cfg.RunPrefix = prefix
+	cfg.Runtime = RuntimeProfile{
+		Language:  "custom",
+		Kind:      "prefix",
+		Name:      "custom",
+		Version:   "",
+		RunPrefix: prefix,
+	}
+
+	saveConfig(cfg)
+	writeProjectContext(cfg)
+
+	fmt.Println("[ok] custom runtime prefix configured.")
+	envShowCmd()
+}
+
+func envClearCmd() {
+	cfg := loadConfig()
+
+	cfg.RunPrefix = ""
+	cfg.Runtime = RuntimeProfile{}
+
+	saveConfig(cfg)
+	writeProjectContext(cfg)
+
+	fmt.Println("[ok] runtime configuration cleared.")
 }
 
 func pullCmd() {
@@ -589,6 +879,11 @@ func doctorCmd() {
 		} else {
 			fmt.Println("Run prefix: none")
 		}
+		if strings.TrimSpace(cfg.Runtime.Language) != "" {
+			fmt.Println("Runtime:", cfg.Runtime.Language, cfg.Runtime.Kind, cfg.Runtime.Name)
+		} else {
+			fmt.Println("Runtime: not configured")
+		}
 	} else {
 		fmt.Println()
 		fmt.Println("Project initialized: no")
@@ -687,7 +982,6 @@ func remoteListFiles(cfg Config) []string {
 
 		files = append(files, line)
 	}
-
 	return files
 }
 
@@ -767,7 +1061,6 @@ func excludedRemoteFile(p string) bool {
 			return true
 		}
 	}
-
 	return excludedFile(filepath.Base(p))
 }
 
@@ -793,6 +1086,10 @@ func confirm(prompt string) bool {
 }
 
 func quote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func shellToken(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
