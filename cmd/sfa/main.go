@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 type Config struct {
 	Alias     string `json:"alias"`
@@ -41,8 +41,16 @@ func main() {
 		logCmd(os.Args[2:])
 	case "status", "test":
 		statusCmd()
+	case "pull":
+		pullCmd()
+	case "clean-code":
+		cleanCodeCmd()
+	case "destroy":
+		destroyCmd()
 	case "doctor":
 		doctorCmd()
+	case "version":
+		versionCmd()
 	case "uninstall":
 		uninstallCmd(os.Args[2:])
 	case "--help", "-h", "help":
@@ -58,12 +66,16 @@ func usage() {
 	fmt.Printf(`ssh-for-agents %s
 
 Usage:
-  sfa init --alias ALIAS --host HOST --user USER --port PORT --remote-dir DIR [--identity-file FILE] [--run-prefix CMD]
+  sfa init --alias ALIAS --host HOST --user USER --port PORT (--remote-dir DIR | --remote-base DIR) [--identity-file FILE] [--run-prefix CMD]
   sfa run "COMMAND"
   sfa bg-run JOB "COMMAND"
   sfa log logs/JOB.log [N]
   sfa status
+  sfa pull
+  sfa clean-code
+  sfa destroy
   sfa doctor
+  sfa version
   sfa uninstall [--all]
 
 `, version)
@@ -144,8 +156,15 @@ func initCmd(args []string) {
 	user := arg(args, "--user", "")
 	port := arg(args, "--port", "22")
 	remoteDir := arg(args, "--remote-dir", "")
+	remoteBase := arg(args, "--remote-base", "")
 	identityFile := arg(args, "--identity-file", "")
 	runPrefix := arg(args, "--run-prefix", "")
+
+	if remoteDir == "" && remoteBase != "" {
+		cwd, _ := os.Getwd()
+		localName := filepath.Base(cwd)
+		remoteDir = strings.TrimRight(remoteBase, "/") + "/" + localName
+	}
 
 	if alias == "" || host == "" || user == "" || remoteDir == "" {
 		usage()
@@ -296,6 +315,14 @@ Check remote status with:
 
 sfa status
 
+Pull remote code back to local with:
+
+sfa pull
+
+Clean local and remote code/test files with:
+
+sfa clean-code
+
 After modifying code, run the appropriate remote command and verify the result.
 
 Never ask the user to paste passwords into chat.
@@ -304,6 +331,8 @@ If password auth is needed, the user should type it only into the terminal promp
 ## Safety
 
 sfa uninstall never modifies SSH config files, SSH keys, or remote server files.
+
+sfa destroy deletes the current local project directory and its configured remote directory only after confirmation.
 `, cfg.Alias, cfg.RemoteDir)
 
 	must(os.WriteFile("AGENTS.md", []byte(agents), 0644))
@@ -419,6 +448,126 @@ func statusCmd() {
 	must(run("ssh", cfg.Alias, "sh -lc "+quote(remote)))
 }
 
+func pullCmd() {
+	cfg := loadConfig()
+
+	fmt.Println("This will pull remote code mirror files back into the current local directory.")
+	fmt.Println("Local files with the same paths may be overwritten.")
+	fmt.Println()
+	fmt.Println("It will NOT pull logs, outputs, checkpoints, pids, data, datasets, .agent, AGENTS.md, CLAUDE.md, or PROJECT_CONTEXT.md.")
+	fmt.Println()
+	if !confirm("Continue? [y/N] ") {
+		fmt.Println("Cancelled.")
+		return
+	}
+
+	files := remoteListFiles(cfg)
+	for _, rel := range files {
+		rel = strings.TrimPrefix(rel, "./")
+		localPath := filepath.FromSlash(rel)
+		parent := filepath.Dir(localPath)
+		if parent != "." {
+			must(os.MkdirAll(parent, 0755))
+		}
+		remotePath := strings.TrimRight(cfg.RemoteDir, "/") + "/" + filepath.ToSlash(rel)
+		must(run("scp", cfg.Alias+":"+remotePath, localPath))
+	}
+
+	fmt.Printf("[ok] pulled %d files from remote code mirror.\n", len(files))
+}
+
+func cleanCodeCmd() {
+	cfg := loadConfig()
+
+	fmt.Println("This will remove syncable code/test files from both local and remote workspaces.")
+	fmt.Println()
+	fmt.Println("It WILL remove:")
+	fmt.Println("  - local and remote syncable code files")
+	fmt.Println("  - local and remote logs/")
+	fmt.Println("  - local and remote outputs/")
+	fmt.Println("  - local and remote pids/")
+	fmt.Println()
+	fmt.Println("It WILL NOT remove:")
+	fmt.Println("  - .agent/")
+	fmt.Println("  - AGENTS.md, CLAUDE.md, PROJECT_CONTEXT.md")
+	fmt.Println("  - .git/")
+	fmt.Println("  - checkpoints/")
+	fmt.Println("  - data/")
+	fmt.Println("  - datasets/")
+	fmt.Println("  - SSH config, SSH keys, or unrelated remote files")
+	fmt.Println()
+
+	if !confirm("Continue? [y/N] ") {
+		fmt.Println("Cancelled.")
+		return
+	}
+
+	localFiles := collectFiles()
+	for _, f := range localFiles {
+		_ = os.Remove(f)
+	}
+	for _, d := range []string{"logs", "outputs", "pids"} {
+		_ = os.RemoveAll(d)
+	}
+
+	remoteFiles := remoteListFiles(cfg)
+	for _, rel := range remoteFiles {
+		rel = strings.TrimPrefix(rel, "./")
+		remotePath := strings.TrimRight(cfg.RemoteDir, "/") + "/" + filepath.ToSlash(rel)
+		must(run("ssh", cfg.Alias, "rm -f "+quote(remotePath)))
+	}
+
+	remoteClean := fmt.Sprintf("rm -rf %s %s %s",
+		quote(strings.TrimRight(cfg.RemoteDir, "/")+"/logs"),
+		quote(strings.TrimRight(cfg.RemoteDir, "/")+"/outputs"),
+		quote(strings.TrimRight(cfg.RemoteDir, "/")+"/pids"),
+	)
+	must(run("ssh", cfg.Alias, remoteClean))
+
+	fmt.Printf("[ok] removed %d local files and %d remote files, plus logs/ outputs/ pids/.\n", len(localFiles), len(remoteFiles))
+}
+
+func destroyCmd() {
+	cfg := loadConfig()
+	cwd, err := os.Getwd()
+	must(err)
+	projectName := filepath.Base(cwd)
+
+	fmt.Println("DANGER: This will delete the entire project.")
+	fmt.Println()
+	fmt.Println("It WILL remove:")
+	fmt.Println("  - current local project directory:", cwd)
+	fmt.Println("  - configured remote directory:", cfg.Alias+":"+cfg.RemoteDir)
+	fmt.Println()
+	fmt.Println("It WILL NOT remove or modify:")
+	fmt.Println("  - ~/.ssh/config")
+	fmt.Println("  - SSH keys")
+	fmt.Println("  - GitHub repositories")
+	fmt.Println("  - unrelated remote files")
+	fmt.Println()
+	fmt.Printf("Type the local project directory name to confirm [%s]: ", projectName)
+
+	reader := bufio.NewReader(os.Stdin)
+	ans, _ := reader.ReadString('\n')
+	ans = strings.TrimSpace(ans)
+
+	if ans != projectName {
+		fmt.Println("Cancelled.")
+		return
+	}
+
+	must(run("ssh", cfg.Alias, "rm -rf "+quote(cfg.RemoteDir)))
+	parent := filepath.Dir(cwd)
+
+	if err := os.Chdir(parent); err != nil {
+		fmt.Println("Warning: failed to move out of project directory:", err)
+	}
+
+	must(os.RemoveAll(cwd))
+
+	fmt.Println("[ok] local and remote project directories removed.")
+}
+
 func doctorCmd() {
 	fmt.Println("ssh-for-agents", version)
 	fmt.Println("OS:", runtime.GOOS, runtime.GOARCH)
@@ -429,6 +578,25 @@ func doctorCmd() {
 			fmt.Println("MISSING:", c)
 		}
 	}
+
+	if _, err := os.Stat(configPath()); err == nil {
+		cfg := loadConfig()
+		fmt.Println()
+		fmt.Println("Project initialized: yes")
+		fmt.Println("Remote:", cfg.Alias+":"+cfg.RemoteDir)
+		if strings.TrimSpace(cfg.RunPrefix) != "" {
+			fmt.Println("Run prefix:", cfg.RunPrefix)
+		} else {
+			fmt.Println("Run prefix: none")
+		}
+	} else {
+		fmt.Println()
+		fmt.Println("Project initialized: no")
+	}
+}
+
+func versionCmd() {
+	fmt.Println("ssh-for-agents", version)
 }
 
 func uninstallCmd(args []string) {
@@ -449,13 +617,7 @@ func uninstallCmd(args []string) {
 	fmt.Println("  - SSH keys under ~/.ssh/")
 	fmt.Println("  - remote server files")
 	fmt.Println()
-	fmt.Print("Continue? [y/N] ")
-
-	reader := bufio.NewReader(os.Stdin)
-	ans, _ := reader.ReadString('\n')
-	ans = strings.TrimSpace(ans)
-
-	if ans != "y" && ans != "Y" && ans != "yes" && ans != "YES" {
+	if !confirm("Continue? [y/N] ") {
 		fmt.Println("Cancelled.")
 		return
 	}
@@ -497,6 +659,36 @@ func syncToRemote(cfg Config) {
 		must(run("ssh", cfg.Alias, "mkdir -p "+quote(remoteParent)))
 		must(run("scp", local, cfg.Alias+":"+remotePath))
 	}
+}
+
+func remoteListFiles(cfg Config) []string {
+	findCmd := fmt.Sprintf(
+		`cd %s && find . -type f -print`,
+		quote(cfg.RemoteDir),
+	)
+
+	out, err := output("ssh", cfg.Alias, "sh -lc "+quote(findCmd))
+	if err != nil {
+		fmt.Print(out)
+		must(err)
+	}
+
+	var files []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		rel := strings.TrimPrefix(line, "./")
+		if excludedRemoteFile(rel) {
+			continue
+		}
+
+		files = append(files, line)
+	}
+
+	return files
 }
 
 func collectFiles() []string {
@@ -568,6 +760,17 @@ func excludedFile(p string) bool {
 	return false
 }
 
+func excludedRemoteFile(p string) bool {
+	parts := strings.Split(filepath.ToSlash(p), "/")
+	for _, part := range parts {
+		if excludedDir(part) {
+			return true
+		}
+	}
+
+	return excludedFile(filepath.Base(p))
+}
+
 func remoteRun(cfg Config, cmd string) {
 	remoteCmd := withPrefix(cfg, cmd)
 	remote := fmt.Sprintf("cd %s && %s", quote(cfg.RemoteDir), remoteCmd)
@@ -579,6 +782,14 @@ func withPrefix(cfg Config, cmd string) string {
 		return cmd
 	}
 	return cfg.RunPrefix + " && " + cmd
+}
+
+func confirm(prompt string) bool {
+	fmt.Print(prompt)
+	reader := bufio.NewReader(os.Stdin)
+	ans, _ := reader.ReadString('\n')
+	ans = strings.TrimSpace(ans)
+	return ans == "y" || ans == "Y" || ans == "yes" || ans == "YES"
 }
 
 func quote(s string) string {
