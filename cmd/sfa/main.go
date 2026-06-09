@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 type RuntimeProfile struct {
 	Language  string `json:"language"`
@@ -322,6 +322,7 @@ The remote directory is a runnable code mirror.
 
 Only code and project configuration files are synced.
 Runtime artifacts such as logs, outputs, checkpoints, pids, data, and datasets are not synchronized and do not need to match the local directory.
+Environment files such as .env and .env.* are not synchronized.
 
 ## Workflow
 
@@ -744,7 +745,7 @@ func pullCmd() {
 	fmt.Println("This will pull remote code mirror files back into the current local directory.")
 	fmt.Println("Local files with the same paths may be overwritten.")
 	fmt.Println()
-	fmt.Println("It will NOT pull logs, outputs, checkpoints, pids, data, datasets, .agent, AGENTS.md, CLAUDE.md, or PROJECT_CONTEXT.md.")
+	fmt.Println("It will NOT pull logs, outputs, checkpoints, pids, data, datasets, .env files, .agent, AGENTS.md, CLAUDE.md, or PROJECT_CONTEXT.md.")
 	fmt.Println()
 	if !confirm("Continue? [y/N] ") {
 		fmt.Println("Cancelled.")
@@ -1043,7 +1044,7 @@ func excludedDir(p string) bool {
 func excludedFile(p string) bool {
 	base := filepath.Base(p)
 
-	if base == "AGENTS.md" || base == "CLAUDE.md" || base == "PROJECT_CONTEXT.md" || base == ".DS_Store" {
+	if base == "AGENTS.md" || base == "CLAUDE.md" || base == "PROJECT_CONTEXT.md" || base == ".DS_Store" || isEnvFile(base) {
 		return true
 	}
 
@@ -1052,6 +1053,10 @@ func excludedFile(p string) bool {
 	}
 
 	return false
+}
+
+func isEnvFile(base string) bool {
+	return base == ".env" || strings.HasPrefix(base, ".env.")
 }
 
 func excludedRemoteFile(p string) bool {

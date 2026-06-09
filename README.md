@@ -14,6 +14,7 @@ Turn any local folder into an AI-agent-friendly SSH workspace.
 - Works with macOS, Linux, and Windows
 - Local directory is the source of truth for code
 - Remote directory is a runnable code mirror
+- Environment files such as `.env` and `.env.*` are never synced
 - Foreground command execution
 - Background jobs with logs and PID tracking
 - Pull remote code back to local
@@ -152,5 +153,45 @@ will use:
 
 The local directory name is preserved exactly, including case.
 
+### **Sync exclusions**
+
+`sfa run` and `sfa bg-run` sync local files to the remote code mirror before running commands. `sfa pull` copies remote code mirror files back to the local directory.
+
+Both directions skip environment files and runtime artifacts. Files named `.env` or starting with `.env.` are not synchronized, including examples such as:
+
+~~~text
+.env
+.env.local
+.env.production
+.env.development.local
+~~~
+
+The following directories are also skipped wherever they appear:
+
+~~~text
+.agent/
+.git/
+.venv/
+__pycache__/
+logs/
+outputs/
+checkpoints/
+remote_logs/
+pids/
+data/
+datasets/
+~~~
+
+The following files are skipped wherever they appear:
+
+~~~text
+AGENTS.md
+CLAUDE.md
+PROJECT_CONTEXT.md
+.DS_Store
+*.pyc
+~~~
+
+`sfa` does not read `.gitignore` during sync.
 
 
