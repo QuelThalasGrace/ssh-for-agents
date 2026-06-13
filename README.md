@@ -15,14 +15,15 @@ Turn any local folder into an AI-agent-friendly SSH workspace.
 - 本地目录是代码的事实来源。 / The local directory is the source of truth for code.
 - 远程目录是可运行的代码镜像。 / The remote directory is a runnable code mirror.
 - `.env` 和 `.env.*` 等环境变量文件永不同步。 / Environment files such as `.env` and `.env.*` are never synced.
-- 支持显式同步，避免每次运行都传输大项目。 / Supports explicit sync so large projects do not need to transfer files before every run.
+- 支持显式同步和指定文件同步，避免每次运行都传输大项目。 / Supports explicit sync and selected-file sync so large projects do not need to transfer every file before every run.
 - 支持前台命令执行。 / Supports foreground command execution.
 - 支持后台任务、日志和 PID 跟踪。 / Supports background jobs with logs and PID tracking.
 - 支持把远程代码拉回本地。 / Supports pulling remote code back to local.
 - 支持清理本地和远程的代码与测试产物。 / Supports cleaning local and remote code and test artifacts.
 - 删除本地与远程项目目录前需要确认。 / Destroying local and remote project directories requires confirmation.
 - 安全卸载不会修改 SSH config 或 SSH keys。 / Safe uninstall never touches SSH config or SSH keys.
-- 自动生成适合 Agent 阅读的 `AGENTS.md` 和 `CLAUDE.md`。 / Generates agent-friendly `AGENTS.md` and `CLAUDE.md`.
+- 支持在线更新 `sfa` 并刷新 `SFA.md`。 / Supports online `sfa` upgrades and `SFA.md` refreshes.
+- 自动生成适合 Agent 阅读的 `SFA.md`，并为 Codex 和 Claude Code 配置轻量入口。 / Generates agent-friendly `SFA.md` and lightweight Codex and Claude Code entry points.
 
 ## 安装 / Install
 
@@ -209,7 +210,9 @@ If the remote server requires password login, type the password only in the term
 - 如果使用密码登录，会安装 public key。 / Install the public key if password login is used.
 - 创建或复用远程目录。 / Create or reuse the remote directory.
 - 生成 `.agent/config.json`。 / Generate `.agent/config.json`.
-- 生成 `AGENTS.md` 和 `CLAUDE.md`。 / Generate `AGENTS.md` and `CLAUDE.md`.
+- 生成 `SFA.md`。 / Generate `SFA.md`.
+- 配置 `.codex/config.toml` 让 Codex 识别 `SFA.md`。 / Configure `.codex/config.toml` so Codex can discover `SFA.md`.
+- 配置 `.claude/CLAUDE.md` 让 Claude Code 导入 `SFA.md`。 / Configure `.claude/CLAUDE.md` so Claude Code imports `SFA.md`.
 - 运行一个与语言无关的 shell hello test。 / Run a language-agnostic shell hello test.
 
 ## 保持本地和远程目录名一致 / Keep local and remote directory names consistent
@@ -248,6 +251,14 @@ After editing code, sync local files to the remote code mirror first:
 sfa sync
 ~~~
 
+如果只改了少量文件，可以只同步这些文件。
+If only a few files changed, sync only those files:
+
+~~~bash
+sfa sync src/train.py
+sfa sync src/train.py src/config.py
+~~~
+
 默认情况下，`sfa run` 和 `sfa bg-run` 只运行远程命令，不会自动同步。
 By default, `sfa run` and `sfa bg-run` only run remote commands and do not sync automatically.
 
@@ -267,6 +278,22 @@ sfa bg-run --sync train "python train.py"
 `sfa pull` 会把远程代码镜像文件复制回本地目录。
 `sfa pull` copies remote code mirror files back to the local directory.
 
+## 更新 sfa / Upgrade sfa
+
+在线更新当前 `sfa` 二进制，并在当前目录已初始化时刷新 `SFA.md` 和 Agent 入口文件。
+Upgrade the current `sfa` binary online, and refresh `SFA.md` and agent entry files when the current directory is initialized:
+
+~~~bash
+sfa upgrade
+~~~
+
+默认从 GitHub 最新 release 下载。可以用 `SFA_BASE_URL` 指向镜像或测试发布目录。
+By default, this downloads from the latest GitHub release. Use `SFA_BASE_URL` to point at a mirror or test release directory:
+
+~~~bash
+SFA_BASE_URL=https://example.com/sfa sfa upgrade
+~~~
+
 ## 同步排除规则 / Sync exclusions
 
 两个方向都会跳过环境变量文件和运行时产物。文件名为 `.env` 或以 `.env.` 开头的文件不会同步，例如：
@@ -284,6 +311,8 @@ The following directories are skipped wherever they appear:
 
 ~~~text
 .agent/
+.codex/
+.claude/
 .git/
 .venv/
 __pycache__/
@@ -303,6 +332,7 @@ The following files are skipped wherever they appear:
 AGENTS.md
 CLAUDE.md
 PROJECT_CONTEXT.md
+SFA.md
 .DS_Store
 *.pyc
 ~~~
@@ -312,21 +342,21 @@ PROJECT_CONTEXT.md
 
 ## 用例：让 Agent 配置远程 conda Python 环境 / Example: configure a remote conda Python environment with an agent
 
-执行 `sfa init` 后，项目目录中会包含 `AGENTS.md`、`.agent/config.json`，并且 `sfa` 可以在远程服务器执行安装与配置命令。你可以让本地 Agent 帮你准备远程 Python 运行环境。
-After `sfa init`, the project directory contains `AGENTS.md`, `.agent/config.json`, and the `sfa` command can run setup commands on the remote server. You can ask a local agent to prepare the remote Python runtime for you.
+执行 `sfa init` 后，项目目录中会包含 `SFA.md`、`.agent/config.json`、`.codex/config.toml` 和 `.claude/CLAUDE.md`，并且 `sfa` 可以在远程服务器执行安装与配置命令。你可以让本地 Agent 帮你准备远程 Python 运行环境。
+After `sfa init`, the project directory contains `SFA.md`, `.agent/config.json`, `.codex/config.toml`, and `.claude/CLAUDE.md`, and the `sfa` command can run setup commands on the remote server. You can ask a local agent to prepare the remote Python runtime for you.
 
 可以这样对 Agent 提需求。
 Example user prompt to the agent:
 
 ~~~text
-请你先阅读 AGENTS.md，然后帮我在远程服务器使用 miniconda（如果没有就先安装 miniconda）新建一个名为 trading 的 python 版本大于 3.11 的 python 环境，并使用 sfa 中配置 python 环境相关的命令将默认环境设定为 trading。
+请你先阅读 SFA.md，然后帮我在远程服务器使用 miniconda（如果没有就先安装 miniconda）新建一个名为 trading 的 python 版本大于 3.11 的 python 环境，并使用 sfa 中配置 python 环境相关的命令将默认环境设定为 trading。
 ~~~
 
 Agent 应该使用 `sfa run` 和 `sfa env` 完成远程配置。
 The agent should then work through the remote setup with `sfa run` and `sfa env`:
 
-1. 阅读 `AGENTS.md`，确认远程镜像目录和当前运行时配置。
-   Read `AGENTS.md` and confirm the remote mirror and current runtime configuration.
+1. 阅读 `SFA.md`，确认远程镜像目录和当前运行时配置。
+   Read `SFA.md` and confirm the remote mirror and current runtime configuration.
 2. 检查远程服务器是否已经存在 conda。
    Check whether conda already exists on the remote server.
 3. 如果没有 conda，就在远程服务器安装 Miniconda，例如安装到 `~/miniconda3`。
