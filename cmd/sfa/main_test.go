@@ -89,6 +89,85 @@ func TestCollectFilesSkipsEnvFilesInTempProject(t *testing.T) {
 	}
 }
 
+func TestParseRunArgsDefaultsToNoSync(t *testing.T) {
+	syncFirst, cmd, ok := parseRunArgs([]string{"python", "train.py"})
+	if !ok {
+		t.Fatal("parseRunArgs returned ok=false")
+	}
+	if syncFirst {
+		t.Fatal("parseRunArgs syncFirst = true, want false")
+	}
+	if cmd != "python train.py" {
+		t.Fatalf("parseRunArgs command = %q, want %q", cmd, "python train.py")
+	}
+}
+
+func TestParseRunArgsSupportsSyncFlag(t *testing.T) {
+	syncFirst, cmd, ok := parseRunArgs([]string{"--sync", "python train.py"})
+	if !ok {
+		t.Fatal("parseRunArgs returned ok=false")
+	}
+	if !syncFirst {
+		t.Fatal("parseRunArgs syncFirst = false, want true")
+	}
+	if cmd != "python train.py" {
+		t.Fatalf("parseRunArgs command = %q, want %q", cmd, "python train.py")
+	}
+}
+
+func TestParseRunArgsRejectsMissingCommandAfterSyncFlag(t *testing.T) {
+	if _, _, ok := parseRunArgs([]string{"--sync"}); ok {
+		t.Fatal("parseRunArgs returned ok=true, want false")
+	}
+}
+
+func TestParseBgRunArgsDefaultsToNoSync(t *testing.T) {
+	syncFirst, job, cmd, ok := parseBgRunArgs([]string{"train", "python", "train.py"})
+	if !ok {
+		t.Fatal("parseBgRunArgs returned ok=false")
+	}
+	if syncFirst {
+		t.Fatal("parseBgRunArgs syncFirst = true, want false")
+	}
+	if job != "train" {
+		t.Fatalf("parseBgRunArgs job = %q, want %q", job, "train")
+	}
+	if cmd != "python train.py" {
+		t.Fatalf("parseBgRunArgs command = %q, want %q", cmd, "python train.py")
+	}
+}
+
+func TestParseBgRunArgsSupportsSyncFlag(t *testing.T) {
+	syncFirst, job, cmd, ok := parseBgRunArgs([]string{"--sync", "train", "python train.py"})
+	if !ok {
+		t.Fatal("parseBgRunArgs returned ok=false")
+	}
+	if !syncFirst {
+		t.Fatal("parseBgRunArgs syncFirst = false, want true")
+	}
+	if job != "train" {
+		t.Fatalf("parseBgRunArgs job = %q, want %q", job, "train")
+	}
+	if cmd != "python train.py" {
+		t.Fatalf("parseBgRunArgs command = %q, want %q", cmd, "python train.py")
+	}
+}
+
+func TestParseBgRunArgsRejectsMissingJobOrCommand(t *testing.T) {
+	cases := [][]string{
+		{},
+		{"--sync"},
+		{"train"},
+		{"--sync", "train"},
+	}
+
+	for _, args := range cases {
+		if _, _, _, ok := parseBgRunArgs(args); ok {
+			t.Fatalf("parseBgRunArgs(%v) returned ok=true, want false", args)
+		}
+	}
+}
+
 func mustWriteTestFile(t *testing.T, path string) {
 	t.Helper()
 

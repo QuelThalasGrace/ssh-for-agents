@@ -42,6 +42,8 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		initCmd(os.Args[2:])
+	case "sync":
+		syncCmd()
 	case "run":
 		runCmd(os.Args[2:])
 	case "bg-run":
@@ -78,8 +80,9 @@ func usage() {
 
 Usage:
   sfa init --alias ALIAS --host HOST --user USER --port PORT (--remote-dir DIR | --remote-base DIR) [--identity-file FILE] [--run-prefix CMD]
-  sfa run "COMMAND"
-  sfa bg-run JOB "COMMAND"
+  sfa sync
+  sfa run [--sync] "COMMAND"
+  sfa bg-run [--sync] JOB "COMMAND"
   sfa log logs/JOB.log [N]
   sfa status
   sfa pull
@@ -330,13 +333,25 @@ Edit files locally in this directory.
 
 Do not run project code locally unless explicitly requested.
 
-Run foreground commands remotely with:
+After editing code, sync local files to the remote mirror with:
+
+sfa sync
+
+Run foreground commands remotely without syncing with:
 
 sfa run "<command>"
 
-Run long jobs remotely with:
+Or sync and run in one step with:
+
+sfa run --sync "<command>"
+
+Run long jobs remotely without syncing with:
 
 sfa bg-run <job-name> "<command>"
+
+Or sync and start a long job in one step with:
+
+sfa bg-run --sync <job-name> "<command>"
 
 View logs with:
 
@@ -406,13 +421,19 @@ Runtime:
 Run prefix:
 %s
 
-All project commands should be run through:
+After editing code, sync local files to the remote mirror with:
+
+sfa sync
+
+All foreground project commands should be run through:
 
 sfa run "<command>"
 
 For long jobs:
 
 sfa bg-run <job-name> "<command>"
+
+Use --sync with run or bg-run only when code should be synced immediately before execution.
 
 Describe the project language, dependencies, common commands, and experiment notes here.
 `, cfg.Alias, cfg.RemoteDir, runtimeText, emptyText(cfg.RunPrefix, "(none)"))
@@ -429,33 +450,41 @@ echo "user=$(whoami)"
 echo "pwd=$(pwd)"
 `
 	must(os.WriteFile(hello, []byte(content), 0755))
-	runCmd([]string{"sh " + hello})
+	runCmd([]string{"--sync", "sh " + hello})
 	os.Remove(hello)
 	remoteRun(cfg, "rm -f .sfa_hello.sh")
 }
 
+func syncCmd() {
+	cfg := loadConfig()
+	n := syncToRemote(cfg)
+	fmt.Printf("[ok] synced %d files to remote code mirror.\n", n)
+}
+
 func runCmd(args []string) {
-	if len(args) < 1 {
-		fmt.Println(`Usage: sfa run "COMMAND"`)
+	syncFirst, cmd, ok := parseRunArgs(args)
+	if !ok {
+		fmt.Println(`Usage: sfa run [--sync] "COMMAND"`)
 		os.Exit(1)
 	}
 	cfg := loadConfig()
-	cmd := strings.Join(args, " ")
-	syncToRemote(cfg)
+	if syncFirst {
+		syncToRemote(cfg)
+	}
 	remoteRun(cfg, cmd)
 }
 
 func bgRunCmd(args []string) {
-	if len(args) < 2 {
-		fmt.Println(`Usage: sfa bg-run JOB "COMMAND"`)
+	syncFirst, job, cmd, ok := parseBgRunArgs(args)
+	if !ok {
+		fmt.Println(`Usage: sfa bg-run [--sync] JOB "COMMAND"`)
 		os.Exit(1)
 	}
 
 	cfg := loadConfig()
-	job := args[0]
-	cmd := strings.Join(args[1:], " ")
-
-	syncToRemote(cfg)
+	if syncFirst {
+		syncToRemote(cfg)
+	}
 
 	script := fmt.Sprintf(`cd %s
 mkdir -p logs pids
@@ -475,6 +504,42 @@ echo "Log file: logs/%s.log"`,
 	)
 
 	must(run("ssh", cfg.Alias, "sh -lc "+quote(script)))
+}
+
+func parseRunArgs(args []string) (bool, string, bool) {
+	if len(args) < 1 {
+		return false, "", false
+	}
+
+	syncFirst := false
+	if args[0] == "--sync" {
+		syncFirst = true
+		args = args[1:]
+	}
+
+	if len(args) < 1 {
+		return syncFirst, "", false
+	}
+
+	return syncFirst, strings.Join(args, " "), true
+}
+
+func parseBgRunArgs(args []string) (bool, string, string, bool) {
+	if len(args) < 1 {
+		return false, "", "", false
+	}
+
+	syncFirst := false
+	if args[0] == "--sync" {
+		syncFirst = true
+		args = args[1:]
+	}
+
+	if len(args) < 2 {
+		return syncFirst, "", "", false
+	}
+
+	return syncFirst, args[0], strings.Join(args[1:], " "), true
 }
 
 func logCmd(args []string) {
@@ -945,7 +1010,7 @@ func removeInstallFiles() {
 	}
 }
 
-func syncToRemote(cfg Config) {
+func syncToRemote(cfg Config) int {
 	files := collectFiles()
 	for _, rel := range files {
 		local := rel
@@ -955,6 +1020,7 @@ func syncToRemote(cfg Config) {
 		must(run("ssh", cfg.Alias, "mkdir -p "+quote(remoteParent)))
 		must(run("scp", local, cfg.Alias+":"+remotePath))
 	}
+	return len(files)
 }
 
 func remoteListFiles(cfg Config) []string {

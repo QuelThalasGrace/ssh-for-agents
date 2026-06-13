@@ -3,8 +3,8 @@
 把任意本地文件夹变成适合 AI Agent 使用的 SSH 工作区。
 Turn any local folder into an AI-agent-friendly SSH workspace.
 
-`ssh-for-agents` 让 Codex、Claude Code 等本地 Agent 可以在本地修改代码，自动同步到远程 SSH 服务器运行，并取回日志与结果。
-`ssh-for-agents` lets local agents such as Codex and Claude Code edit code locally, sync runnable code to a remote SSH server, run commands in the real remote environment, and return logs/results.
+`ssh-for-agents` 让 Codex、Claude Code 等本地 Agent 可以在本地修改代码，按需同步到远程 SSH 服务器运行，并取回日志与结果。
+`ssh-for-agents` lets local agents such as Codex and Claude Code edit code locally, sync runnable code to a remote SSH server when needed, run commands in the real remote environment, and return logs/results.
 
 ## 功能 / Features
 
@@ -15,6 +15,7 @@ Turn any local folder into an AI-agent-friendly SSH workspace.
 - 本地目录是代码的事实来源。 / The local directory is the source of truth for code.
 - 远程目录是可运行的代码镜像。 / The remote directory is a runnable code mirror.
 - `.env` 和 `.env.*` 等环境变量文件永不同步。 / Environment files such as `.env` and `.env.*` are never synced.
+- 支持显式同步，避免每次运行都传输大项目。 / Supports explicit sync so large projects do not need to transfer files before every run.
 - 支持前台命令执行。 / Supports foreground command execution.
 - 支持后台任务、日志和 PID 跟踪。 / Supports background jobs with logs and PID tracking.
 - 支持把远程代码拉回本地。 / Supports pulling remote code back to local.
@@ -238,10 +239,35 @@ The remote directory will be:
 本地目录名会被完整保留，包括大小写。
 The local directory name is preserved exactly, including case.
 
-## 同步排除规则 / Sync exclusions
+## 同步与运行 / Sync and run
 
-`sfa run` 和 `sfa bg-run` 会在运行命令前把本地文件同步到远程代码镜像。`sfa pull` 会把远程代码镜像文件复制回本地目录。
-`sfa run` and `sfa bg-run` sync local files to the remote code mirror before running commands. `sfa pull` copies remote code mirror files back to the local directory.
+修改代码后，先把本地文件同步到远程代码镜像。
+After editing code, sync local files to the remote code mirror first:
+
+~~~bash
+sfa sync
+~~~
+
+默认情况下，`sfa run` 和 `sfa bg-run` 只运行远程命令，不会自动同步。
+By default, `sfa run` and `sfa bg-run` only run remote commands and do not sync automatically.
+
+~~~bash
+sfa run "python train.py"
+sfa bg-run train "python train.py"
+~~~
+
+如果希望一次性同步并运行，可以使用 `--sync`。
+Use `--sync` to sync and run in one step:
+
+~~~bash
+sfa run --sync "python train.py"
+sfa bg-run --sync train "python train.py"
+~~~
+
+`sfa pull` 会把远程代码镜像文件复制回本地目录。
+`sfa pull` copies remote code mirror files back to the local directory.
+
+## 同步排除规则 / Sync exclusions
 
 两个方向都会跳过环境变量文件和运行时产物。文件名为 `.env` 或以 `.env.` 开头的文件不会同步，例如：
 Both directions skip environment files and runtime artifacts. Files named `.env` or starting with `.env.` are not synchronized, including examples such as:
