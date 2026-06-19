@@ -70,6 +70,7 @@ Apple Silicon Mac：
 mkdir -p ~/.local/bin
 curl -L https://github.com/QuelThalasGrace/ssh-for-agents/releases/latest/download/sfa-darwin-arm64 -o ~/.local/bin/sfa
 chmod +x ~/.local/bin/sfa
+codesign --force --sign - ~/.local/bin/sfa
 ~/.local/bin/sfa doctor
 ~~~
 
@@ -79,6 +80,7 @@ Intel Mac：
 mkdir -p ~/.local/bin
 curl -L https://github.com/QuelThalasGrace/ssh-for-agents/releases/latest/download/sfa-darwin-amd64 -o ~/.local/bin/sfa
 chmod +x ~/.local/bin/sfa
+codesign --force --sign - ~/.local/bin/sfa
 ~/.local/bin/sfa doctor
 ~~~
 
@@ -93,6 +95,20 @@ chmod +x ~/.local/bin/sfa
 
 如果希望直接输入 `sfa` 而不是 `~/.local/bin/sfa`，请使用上面的永久 PATH 配置。
 Use the permanent PATH setup above if you want to run `sfa` without typing `~/.local/bin/sfa`.
+
+### macOS 本地源码安装 / Local source install on macOS
+
+如果你从源码目录本地编译安装，macOS 可能会因为临时签名状态直接终止新二进制并显示 `zsh: killed`。安装后重新做一次 ad-hoc signing 即可。
+If you build and install from the source directory, macOS may terminate the new binary with `zsh: killed` because of its temporary signing state. Re-sign it locally after installation:
+
+~~~bash
+go build -o sfa ./cmd/sfa
+mkdir -p ~/.local/bin
+cp ./sfa ~/.local/bin/sfa
+chmod +x ~/.local/bin/sfa
+codesign --force --sign - ~/.local/bin/sfa
+sfa version
+~~~
 
 ### Windows PowerShell
 
@@ -141,11 +157,16 @@ If the browser downloads a zip file, unzip it first and move the extracted `sfa-
 mkdir -p ~/.local/bin
 mv ~/Downloads/sfa-darwin-arm64 ~/.local/bin/sfa
 chmod +x ~/.local/bin/sfa
+xattr -dr com.apple.quarantine ~/.local/bin/sfa 2>/dev/null || true
+codesign --force --sign - ~/.local/bin/sfa
 ~/.local/bin/sfa doctor
 ~~~
 
 请把 `sfa-darwin-arm64` 替换为你实际下载的文件名。
 Replace `sfa-darwin-arm64` with the file you downloaded.
+
+如果 macOS 执行时显示 `zsh: killed`，请再次运行上面的 `xattr` 和 `codesign` 两行。
+If macOS prints `zsh: killed` when executing `sfa`, run the `xattr` and `codesign` lines above again.
 
 4. 在 Windows PowerShell 本地安装下载的文件。
    Install the downloaded file locally on Windows PowerShell:
