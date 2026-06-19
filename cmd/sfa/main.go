@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const version = "0.3.0"
+const version = "0.3.1"
 
 type RuntimeProfile struct {
 	Language  string `json:"language"`
@@ -66,7 +66,7 @@ func main() {
 	case "status", "test":
 		statusCmd()
 	case "pull":
-		pullCmd()
+		pullCmd(os.Args[2:])
 	case "clean-code":
 		cleanCodeCmd()
 	case "destroy":
@@ -100,7 +100,7 @@ Usage:
   sfa bg-run [--sync] JOB "COMMAND"
   sfa log logs/JOB.log [N]
   sfa status
-  sfa pull
+  sfa pull [FILE...]
   sfa clean-code
   sfa destroy
 
@@ -425,6 +425,10 @@ Pull remote code back to local with:
 
 sfa pull
 
+If only a few remote files are needed, pull those files instead of the whole remote mirror:
+
+sfa pull <file> [file...]
+
 Clean local and remote code/test files with:
 
 sfa clean-code
@@ -656,17 +660,14 @@ func trailingNewlineIfNeeded(original string) string {
 }
 
 func helloTest(cfg Config) {
-	hello := ".sfa_hello.sh"
-	content := `#!/bin/sh
-echo "ssh-for-agents remote hello"
+	remoteRun(cfg, helloTestCommand())
+}
+
+func helloTestCommand() string {
+	return `echo "ssh-for-agents remote hello"
 echo "host=$(hostname)"
 echo "user=$(whoami)"
-echo "pwd=$(pwd)"
-`
-	must(os.WriteFile(hello, []byte(content), 0755))
-	runCmd([]string{"--sync", "sh " + hello})
-	os.Remove(hello)
-	remoteRun(cfg, "rm -f .sfa_hello.sh")
+echo "pwd=$(pwd)"`
 }
 
 func syncCmd(args []string) {
@@ -1023,10 +1024,24 @@ func envClearCmd() {
 	fmt.Println("[ok] runtime configuration cleared.")
 }
 
-func pullCmd() {
+func pullCmd(args []string) {
 	cfg := loadConfig()
 
-	fmt.Println("This will pull remote code mirror files back into the current local directory.")
+	var remoteFiles []string
+	if len(args) == 0 {
+		remoteFiles = remoteListFiles(cfg)
+	}
+	files, err := selectPullFiles(args, remoteFiles)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	if len(args) == 0 {
+		fmt.Println("This will pull remote code mirror files back into the current local directory.")
+	} else {
+		fmt.Printf("This will pull %d remote file(s) back into the current local directory.\n", len(files))
+	}
 	fmt.Println("Local files with the same paths may be overwritten.")
 	fmt.Println()
 	fmt.Println("It will NOT pull logs, outputs, checkpoints, pids, data, datasets, .env files, .agent, .codex, .claude, SFA.md, or legacy agent docs.")
@@ -1036,7 +1051,11 @@ func pullCmd() {
 		return
 	}
 
-	files := remoteListFiles(cfg)
+	n := pullFilesFromRemote(cfg, files)
+	fmt.Printf("[ok] pulled %d files from remote code mirror.\n", n)
+}
+
+func pullFilesFromRemote(cfg Config, files []string) int {
 	for _, rel := range files {
 		rel = strings.TrimPrefix(rel, "./")
 		localPath := filepath.FromSlash(rel)
@@ -1048,7 +1067,51 @@ func pullCmd() {
 		must(run("scp", cfg.Alias+":"+remotePath, localPath))
 	}
 
-	fmt.Printf("[ok] pulled %d files from remote code mirror.\n", len(files))
+	return len(files)
+}
+
+func selectPullFiles(args []string, remoteFiles []string) ([]string, error) {
+	if len(args) == 0 {
+		return remoteFiles, nil
+	}
+
+	var files []string
+	seen := map[string]bool{}
+	for _, arg := range args {
+		rel, err := validatePullFile(arg)
+		if err != nil {
+			return nil, err
+		}
+		if seen[rel] {
+			continue
+		}
+		seen[rel] = true
+		files = append(files, rel)
+	}
+	return files, nil
+}
+
+func validatePullFile(arg string) (string, error) {
+	if strings.TrimSpace(arg) == "" {
+		return "", fmt.Errorf("pull target is empty")
+	}
+	if strings.HasSuffix(arg, "/") || strings.HasSuffix(arg, `\`) {
+		return "", fmt.Errorf("pull target is a directory, not a file: %s", arg)
+	}
+
+	clean := filepath.Clean(arg)
+	if filepath.IsAbs(clean) {
+		return "", fmt.Errorf("pull target must be relative to the remote code mirror: %s", arg)
+	}
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("pull target must stay inside the remote code mirror: %s", arg)
+	}
+
+	rel := filepath.ToSlash(clean)
+	if excludedRemoteFile(rel) {
+		return "", fmt.Errorf("pull target is excluded: %s", arg)
+	}
+	return filepath.FromSlash(rel), nil
 }
 
 func cleanCodeCmd() {

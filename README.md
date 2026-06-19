@@ -15,7 +15,7 @@ Turn any local folder into an AI-agent-friendly SSH workspace.
 - 本地目录是代码的事实来源。 / The local directory is the source of truth for code.
 - 远程目录是可运行的代码镜像。 / The remote directory is a runnable code mirror.
 - `.env` 和 `.env.*` 等环境变量文件永不同步。 / Environment files such as `.env` and `.env.*` are never synced.
-- 支持显式同步和指定文件同步，避免每次运行都传输大项目。 / Supports explicit sync and selected-file sync so large projects do not need to transfer every file before every run.
+- 支持显式同步和指定文件双向同步，避免每次运行都传输大项目。 / Supports explicit sync and selected-file sync in both directions so large projects do not need to transfer every file before every run.
 - 支持前台命令执行。 / Supports foreground command execution.
 - 支持后台任务、日志和 PID 跟踪。 / Supports background jobs with logs and PID tracking.
 - 支持把远程代码拉回本地。 / Supports pulling remote code back to local.
@@ -213,7 +213,7 @@ If the remote server requires password login, type the password only in the term
 - 生成 `SFA.md`。 / Generate `SFA.md`.
 - 配置 `.codex/config.toml` 让 Codex 识别 `SFA.md`。 / Configure `.codex/config.toml` so Codex can discover `SFA.md`.
 - 配置 `.claude/CLAUDE.md` 让 Claude Code 导入 `SFA.md`。 / Configure `.claude/CLAUDE.md` so Claude Code imports `SFA.md`.
-- 运行一个与语言无关的 shell hello test。 / Run a language-agnostic shell hello test.
+- 运行一个不上传项目文件的远程 shell hello test。 / Run a remote shell hello test without uploading project files.
 
 ## 保持本地和远程目录名一致 / Keep local and remote directory names consistent
 
@@ -277,6 +277,18 @@ sfa bg-run --sync train "python train.py"
 
 `sfa pull` 会把远程代码镜像文件复制回本地目录。
 `sfa pull` copies remote code mirror files back to the local directory.
+
+~~~bash
+sfa pull
+~~~
+
+如果只需要取回少量远端文件，可以只拉这些文件。
+If only a few remote files are needed, pull only those files:
+
+~~~bash
+sfa pull src/generated.py
+sfa pull src/train.py src/config.py
+~~~
 
 ## 更新 sfa / Upgrade sfa
 

@@ -300,6 +300,27 @@ func TestRefreshProjectDocsIfInitializedSkipsUninitializedDirectory(t *testing.T
 	}
 }
 
+func TestHelloTestCommandDoesNotReferenceSyncScript(t *testing.T) {
+	cmd := helloTestCommand()
+
+	for _, want := range []string{
+		`echo "ssh-for-agents remote hello"`,
+		`echo "host=$(hostname)"`,
+		`echo "user=$(whoami)"`,
+		`echo "pwd=$(pwd)"`,
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Fatalf("helloTestCommand missing %q in:\n%s", want, cmd)
+		}
+	}
+	if strings.Contains(cmd, ".sfa_hello.sh") {
+		t.Fatalf("helloTestCommand still references .sfa_hello.sh:\n%s", cmd)
+	}
+	if strings.Contains(cmd, "sync") {
+		t.Fatalf("helloTestCommand unexpectedly mentions sync:\n%s", cmd)
+	}
+}
+
 func TestExcludedFileSkipsEnvFiles(t *testing.T) {
 	cases := []string{
 		".env",
@@ -416,6 +437,49 @@ func TestSelectSyncFilesRejectsUnsafeOrExcludedTargets(t *testing.T) {
 	for _, args := range cases {
 		if files, err := selectSyncFiles(args); err == nil {
 			t.Fatalf("selectSyncFiles(%v) = %v, nil error; want error", args, files)
+		}
+	}
+}
+
+func TestSelectPullFilesDefaultsToRemoteList(t *testing.T) {
+	files, err := selectPullFiles(nil, []string{"./main.go", "./service/app.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"./main.go", "./service/app.go"}
+	if strings.Join(files, "|") != strings.Join(want, "|") {
+		t.Fatalf("selectPullFiles returned %v, want %v", files, want)
+	}
+}
+
+func TestSelectPullFilesAcceptsOneOrMoreRemoteFiles(t *testing.T) {
+	files, err := selectPullFiles([]string{"main.go", filepath.Join("service", "app.go")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"main.go", filepath.Join("service", "app.go")}
+	if strings.Join(files, "|") != strings.Join(want, "|") {
+		t.Fatalf("selectPullFiles returned %v, want %v", files, want)
+	}
+}
+
+func TestSelectPullFilesRejectsUnsafeOrExcludedTargets(t *testing.T) {
+	cases := [][]string{
+		{"."},
+		{".."},
+		{filepath.Join("..", "outside.go")},
+		{"/tmp/outside.go"},
+		{"SFA.md"},
+		{".env"},
+		{filepath.Join(".agent", "config.json")},
+		{filepath.Join("logs", "job.log")},
+	}
+
+	for _, args := range cases {
+		if files, err := selectPullFiles(args, nil); err == nil {
+			t.Fatalf("selectPullFiles(%v) = %v, nil error; want error", args, files)
 		}
 	}
 }
