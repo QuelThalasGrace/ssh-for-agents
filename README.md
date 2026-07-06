@@ -198,6 +198,9 @@ scp
 不需要任何语言运行时。
 No language runtime is required.
 
+全量同步会优先使用远端的 `tar` 解压归档；如果远端没有 `tar`，会自动退回逐文件 `scp` 同步。
+Full sync prefers remote `tar` to extract an archive. If remote `tar` is unavailable, it falls back to per-file `scp` sync.
+
 ## 快速开始 / Quickstart
 
 创建或进入一个本地项目目录。
@@ -212,13 +215,11 @@ cd my_project
 Initialize a remote SSH workspace:
 
 ~~~bash
-sfa init \
-  --alias myserver \
-  --host 1.2.3.4 \
-  --user ubuntu \
-  --port 22 \
-  --remote-dir /home/ubuntu/my_project
+sfa init myserver
 ~~~
+
+这里的 `myserver` 是 `~/.ssh/config` 中已经存在且可以免密登录的 `Host` 名称。默认远端目录是服务器 `$HOME/<当前本地目录名>`。
+Here `myserver` is an existing passwordless `Host` entry in `~/.ssh/config`. The default remote directory is `$HOME/<current-local-directory-name>` on the server.
 
 如果远程服务器需要密码登录，请只在终端提示中输入密码，不要把密码粘贴到 Codex、Claude Code 或聊天窗口。
 If the remote server requires password login, type the password only in the terminal prompt. Do not paste passwords into Codex, Claude Code, or chat.
@@ -226,9 +227,9 @@ If the remote server requires password login, type the password only in the term
 `sfa init` 会执行以下操作。
 `sfa init` will:
 
-- 按需配置 SSH alias。 / Configure SSH alias if needed.
-- 按需生成 SSH key。 / Generate an SSH key if needed.
-- 如果使用密码登录，会安装 public key。 / Install the public key if password login is used.
+- 复用已有 SSH config Host，或按需配置 SSH alias。 / Reuse an existing SSH config Host, or configure an SSH alias if needed.
+- 使用完整参数初始化时，按需生成 SSH key。 / Generate an SSH key if needed when using the full init form.
+- 使用完整参数初始化且需要密码登录时，会安装 public key。 / Install the public key when using the full init form and password login is needed.
 - 创建或复用远程目录。 / Create or reuse the remote directory.
 - 生成 `.agent/config.json`。 / Generate `.agent/config.json`.
 - 生成 `SFA.md`。 / Generate `SFA.md`.
@@ -245,12 +246,7 @@ You can use `--remote-base` instead of `--remote-dir`.
 If the local directory is `HDCN`, for example:
 
 ~~~bash
-sfa init \
-  --alias s518 \
-  --host 162.105.183.229 \
-  --user s514-2 \
-  --port 2621 \
-  --remote-base /data1/s514-2/project
+sfa init s518 --remote-base /data1/s514-2/project
 ~~~
 
 远程目录会是：
@@ -263,6 +259,25 @@ The remote directory will be:
 本地目录名会被完整保留，包括大小写。
 The local directory name is preserved exactly, including case.
 
+如果想完全指定远端目录，可以使用 `--remote-dir`。
+Use `--remote-dir` to specify the exact remote directory:
+
+~~~bash
+sfa init s518 --remote-dir /data1/s514-2/project/HDCN
+~~~
+
+如果还没有可用的 SSH config Host，仍然可以使用完整参数让 `sfa` 配置 SSH alias 和 key。
+If you do not already have a usable SSH config Host, use the full form so `sfa` can configure the SSH alias and key:
+
+~~~bash
+sfa init \
+  --alias myserver \
+  --host 1.2.3.4 \
+  --user ubuntu \
+  --port 22 \
+  --remote-dir /home/ubuntu/my_project
+~~~
+
 ## 同步与运行 / Sync and run
 
 修改代码后，先把本地文件同步到远程代码镜像。
@@ -271,6 +286,9 @@ After editing code, sync local files to the remote code mirror first:
 ~~~bash
 sfa sync
 ~~~
+
+全量 `sfa sync` 会把可同步文件打成归档后上传并在远端解压，比逐文件传输更适合大项目。
+Full `sfa sync` uploads syncable files as an archive and extracts it remotely, which is faster than per-file transfer for larger projects.
 
 如果只改了少量文件，可以只同步这些文件。
 If only a few files changed, sync only those files:
@@ -294,6 +312,15 @@ Use `--sync` to sync and run in one step:
 ~~~bash
 sfa run --sync "python train.py"
 sfa bg-run --sync train "python train.py"
+~~~
+
+同步和拉取默认启用 SSH connection reuse 来降低多次 `ssh` / `scp` 的连接延迟。如果服务器或跳板环境不兼容，可以关闭：
+Sync and pull enable SSH connection reuse by default to reduce repeated `ssh` / `scp` connection latency. Disable it if a server or jump-host setup is incompatible:
+
+~~~bash
+sfa sync --no-ssh-reuse
+sfa pull --no-ssh-reuse
+SFA_SSH_REUSE=0 sfa run --sync "python train.py"
 ~~~
 
 `sfa pull` 会把远程代码镜像文件复制回本地目录。
@@ -349,6 +376,8 @@ The following directories are skipped wherever they appear:
 .git/
 .venv/
 __pycache__/
+bin/
+obj/
 logs/
 outputs/
 checkpoints/

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -337,6 +340,42 @@ func TestExcludedFileSkipsEnvFiles(t *testing.T) {
 	}
 }
 
+func TestExcludedDirSkipsDotnetBuildDirectories(t *testing.T) {
+	for _, path := range []string{
+		"bin",
+		"obj",
+		filepath.Join("App", "bin"),
+		filepath.Join("App", "obj"),
+	} {
+		if !excludedDir(path) {
+			t.Fatalf("excludedDir(%q) = false, want true", path)
+		}
+	}
+}
+
+func TestCollectFilesSkipsDotnetBuildDirectories(t *testing.T) {
+	chdirTemp(t)
+
+	mustWriteTestFile(t, filepath.Join("App", "Program.cs"))
+	mustWriteTestFile(t, filepath.Join("App", "bin", "Debug", "App.dll"))
+	mustWriteTestFile(t, filepath.Join("App", "obj", "project.assets.json"))
+
+	files := map[string]bool{}
+	for _, file := range collectFiles() {
+		files[file] = true
+	}
+
+	if !files[filepath.Join("App", "Program.cs")] {
+		t.Fatal("collectFiles did not include App/Program.cs")
+	}
+	if files[filepath.Join("App", "bin", "Debug", "App.dll")] {
+		t.Fatal("collectFiles included App/bin/Debug/App.dll")
+	}
+	if files[filepath.Join("App", "obj", "project.assets.json")] {
+		t.Fatal("collectFiles included App/obj/project.assets.json")
+	}
+}
+
 func TestCollectFilesSkipsAgentAdapterFilesInTempProject(t *testing.T) {
 	chdirTemp(t)
 
@@ -422,6 +461,8 @@ func TestSelectSyncFilesRejectsUnsafeOrExcludedTargets(t *testing.T) {
 	mustWriteTestFile(t, ".env")
 	mustWriteTestFile(t, filepath.Join(".agent", "config.json"))
 	mustWriteTestFile(t, filepath.Join("logs", "job.log"))
+	mustWriteTestFile(t, filepath.Join("App", "bin", "Debug", "App.dll"))
+	mustWriteTestFile(t, filepath.Join("App", "obj", "project.assets.json"))
 
 	cases := [][]string{
 		{"missing.go"},
@@ -432,6 +473,8 @@ func TestSelectSyncFilesRejectsUnsafeOrExcludedTargets(t *testing.T) {
 		{".env"},
 		{filepath.Join(".agent", "config.json")},
 		{filepath.Join("logs", "job.log")},
+		{filepath.Join("App", "bin", "Debug", "App.dll")},
+		{filepath.Join("App", "obj", "project.assets.json")},
 	}
 
 	for _, args := range cases {
@@ -475,12 +518,140 @@ func TestSelectPullFilesRejectsUnsafeOrExcludedTargets(t *testing.T) {
 		{".env"},
 		{filepath.Join(".agent", "config.json")},
 		{filepath.Join("logs", "job.log")},
+		{filepath.Join("App", "bin", "Debug", "App.dll")},
+		{filepath.Join("App", "obj", "project.assets.json")},
 	}
 
 	for _, args := range cases {
 		if files, err := selectPullFiles(args, nil); err == nil {
 			t.Fatalf("selectPullFiles(%v) = %v, nil error; want error", args, files)
 		}
+	}
+}
+
+func TestMakeSyncArchiveIncludesOnlySelectedFiles(t *testing.T) {
+	dir := chdirTemp(t)
+
+	mustWriteTestFile(t, "main.go")
+	mustWriteTestFile(t, filepath.Join("service", "app.go"))
+	mustWriteTestFile(t, "SFA.md")
+	mustWriteTestFile(t, filepath.Join("App", "bin", "Debug", "App.dll"))
+
+	archivePath, err := makeSyncArchive([]string{"main.go", filepath.Join("service", "app.go")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.Remove(archivePath)
+	})
+
+	got := readTarGzEntries(t, archivePath)
+	for _, want := range []string{"main.go", "service/app.go"} {
+		if !got[want] {
+			t.Fatalf("archive missing %s; entries=%v", want, got)
+		}
+	}
+	for _, skipped := range []string{"SFA.md", "App/bin/Debug/App.dll"} {
+		if got[skipped] {
+			t.Fatalf("archive included %s from %s", skipped, dir)
+		}
+	}
+}
+
+func TestParseSSHConfigHostReadsBasicHostBlock(t *testing.T) {
+	config := `
+Host s518
+    HostName 162.105.183.229
+    User s514-2
+    Port 2621
+    IdentityFile ~/.ssh/s518_agent
+`
+
+	host, ok := parseSSHConfigHost(config, "s518")
+	if !ok {
+		t.Fatal("parseSSHConfigHost did not find s518")
+	}
+	if host.Alias != "s518" || host.HostName != "162.105.183.229" || host.User != "s514-2" || host.Port != "2621" || host.IdentityFile != "~/.ssh/s518_agent" {
+		t.Fatalf("parseSSHConfigHost returned %+v", host)
+	}
+}
+
+func TestParseSSHConfigHostIgnoresOtherHostsAndWildcards(t *testing.T) {
+	config := `
+Host *
+    User default
+    Port 2200
+
+Host s518
+    HostName server.example.com
+`
+
+	host, ok := parseSSHConfigHost(config, "s518")
+	if !ok {
+		t.Fatal("parseSSHConfigHost did not find s518")
+	}
+	if host.User != "" || host.Port != "" {
+		t.Fatalf("parseSSHConfigHost inherited wildcard values unexpectedly: %+v", host)
+	}
+	if host.HostName != "server.example.com" {
+		t.Fatalf("HostName = %q, want server.example.com", host.HostName)
+	}
+}
+
+func TestResolveRemoteDirDefaultsToRemoteHome(t *testing.T) {
+	dir := chdirTemp(t)
+	projectName := filepath.Base(dir)
+
+	remoteDir, err := resolveInitRemoteDir(nil, "/home/s514-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "/home/s514-2/" + projectName
+	if remoteDir != want {
+		t.Fatalf("resolveInitRemoteDir default = %q, want %q", remoteDir, want)
+	}
+}
+
+func TestResolveRemoteDirUsesRemoteBaseAndRemoteDirPrecedence(t *testing.T) {
+	dir := chdirTemp(t)
+	projectName := filepath.Base(dir)
+
+	remoteDir, err := resolveInitRemoteDir([]string{"--remote-base", "/data1/project"}, "/home/s514-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remoteDir != "/data1/project/"+projectName {
+		t.Fatalf("remote-base resolved to %q", remoteDir)
+	}
+
+	remoteDir, err = resolveInitRemoteDir([]string{"--remote-base", "/data1/project", "--remote-dir", "/exact/path"}, "/home/s514-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remoteDir != "/exact/path" {
+		t.Fatalf("remote-dir precedence resolved to %q", remoteDir)
+	}
+}
+
+func TestSSHReuseOptionsDefaultsAndCanBeDisabled(t *testing.T) {
+	t.Setenv("SFA_SSH_REUSE", "")
+
+	opts := sshReuseOptions(false)
+	joined := strings.Join(opts, " ")
+	for _, want := range []string{"ControlMaster=auto", "ControlPersist=60s", "ControlPath=~/.ssh/sfa-%C"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("sshReuseOptions missing %s in %v", want, opts)
+		}
+	}
+
+	if got := sshReuseOptions(true); len(got) != 0 {
+		t.Fatalf("sshReuseOptions(true) = %v, want empty", got)
+	}
+
+	t.Setenv("SFA_SSH_REUSE", "0")
+	if got := sshReuseOptions(false); len(got) != 0 {
+		t.Fatalf("sshReuseOptions with SFA_SSH_REUSE=0 = %v, want empty", got)
 	}
 }
 
@@ -577,6 +748,22 @@ func TestParseRunArgsSupportsSyncFlag(t *testing.T) {
 	}
 }
 
+func TestParseRunArgsSupportsNoSSHReuseFlag(t *testing.T) {
+	opts, ok := parseRunArgsWithOptions([]string{"--sync", "--no-ssh-reuse", "python train.py"})
+	if !ok {
+		t.Fatal("parseRunArgsWithOptions returned ok=false")
+	}
+	if !opts.SyncFirst {
+		t.Fatal("parseRunArgsWithOptions SyncFirst = false, want true")
+	}
+	if !opts.NoSSHReuse {
+		t.Fatal("parseRunArgsWithOptions NoSSHReuse = false, want true")
+	}
+	if opts.Command != "python train.py" {
+		t.Fatalf("parseRunArgsWithOptions Command = %q, want python train.py", opts.Command)
+	}
+}
+
 func TestParseRunArgsRejectsMissingCommandAfterSyncFlag(t *testing.T) {
 	if _, _, ok := parseRunArgs([]string{"--sync"}); ok {
 		t.Fatal("parseRunArgs returned ok=true, want false")
@@ -612,6 +799,25 @@ func TestParseBgRunArgsSupportsSyncFlag(t *testing.T) {
 	}
 	if cmd != "python train.py" {
 		t.Fatalf("parseBgRunArgs command = %q, want %q", cmd, "python train.py")
+	}
+}
+
+func TestParseBgRunArgsSupportsNoSSHReuseFlag(t *testing.T) {
+	opts, ok := parseBgRunArgsWithOptions([]string{"--sync", "--no-ssh-reuse", "train", "python train.py"})
+	if !ok {
+		t.Fatal("parseBgRunArgsWithOptions returned ok=false")
+	}
+	if !opts.SyncFirst {
+		t.Fatal("parseBgRunArgsWithOptions SyncFirst = false, want true")
+	}
+	if !opts.NoSSHReuse {
+		t.Fatal("parseBgRunArgsWithOptions NoSSHReuse = false, want true")
+	}
+	if opts.Job != "train" {
+		t.Fatalf("parseBgRunArgsWithOptions Job = %q, want train", opts.Job)
+	}
+	if opts.Command != "python train.py" {
+		t.Fatalf("parseBgRunArgsWithOptions Command = %q, want python train.py", opts.Command)
 	}
 }
 
@@ -668,4 +874,34 @@ func mustReadTestFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+func readTarGzEntries(t *testing.T, path string) map[string]bool {
+	t.Helper()
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	entries := map[string]bool{}
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatal(err)
+		}
+		entries[hdr.Name] = true
+	}
+	return entries
 }

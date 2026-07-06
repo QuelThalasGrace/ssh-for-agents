@@ -1,9 +1,12 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -14,7 +17,7 @@ import (
 	"time"
 )
 
-const version = "0.3.1"
+const version = "0.3.2"
 
 type RuntimeProfile struct {
 	Language  string `json:"language"`
@@ -33,6 +36,14 @@ type Config struct {
 	RunPrefix string         `json:"run_prefix"`
 	KeyPath   string         `json:"key_path"`
 	Runtime   RuntimeProfile `json:"runtime"`
+}
+
+type SSHConfigHost struct {
+	Alias        string
+	HostName     string
+	User         string
+	Port         string
+	IdentityFile string
 }
 
 const (
@@ -94,13 +105,14 @@ func usage() {
 	fmt.Printf(`ssh-for-agents %s
 
 Usage:
+  sfa init SSH_CONFIG_HOST [--remote-dir DIR | --remote-base DIR] [--run-prefix CMD]
   sfa init --alias ALIAS --host HOST --user USER --port PORT (--remote-dir DIR | --remote-base DIR) [--identity-file FILE] [--run-prefix CMD]
-  sfa sync [FILE...]
-  sfa run [--sync] "COMMAND"
-  sfa bg-run [--sync] JOB "COMMAND"
+  sfa sync [--no-ssh-reuse] [FILE...]
+  sfa run [--sync] [--no-ssh-reuse] "COMMAND"
+  sfa bg-run [--sync] [--no-ssh-reuse] JOB "COMMAND"
   sfa log logs/JOB.log [N]
   sfa status
-  sfa pull [FILE...]
+  sfa pull [--no-ssh-reuse] [FILE...]
   sfa clean-code
   sfa destroy
 
@@ -141,6 +153,17 @@ func hasFlag(args []string, name string) bool {
 	return false
 }
 
+func removeFlag(args []string, name string) []string {
+	var kept []string
+	for _, arg := range args {
+		if arg == name {
+			continue
+		}
+		kept = append(kept, arg)
+	}
+	return kept
+}
+
 func run(name string, args ...string) error {
 	fmt.Println("+", name, strings.Join(args, " "))
 	cmd := exec.Command(name, args...)
@@ -154,6 +177,47 @@ func output(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	b, err := cmd.CombinedOutput()
 	return string(b), err
+}
+
+func sshReuseOptions(noSSHReuse bool) []string {
+	if noSSHReuse || sshReuseDisabledByEnv() {
+		return nil
+	}
+	return []string{
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPersist=60s",
+		"-o", "ControlPath=~/.ssh/sfa-%C",
+	}
+}
+
+func sshReuseDisabledByEnv() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SFA_SSH_REUSE")))
+	return v == "0" || v == "false" || v == "no" || v == "off"
+}
+
+func sshArgs(alias string, noSSHReuse bool, remoteArgs ...string) []string {
+	args := append([]string{}, sshReuseOptions(noSSHReuse)...)
+	args = append(args, alias)
+	args = append(args, remoteArgs...)
+	return args
+}
+
+func scpArgs(noSSHReuse bool, src, dst string) []string {
+	args := append([]string{}, sshReuseOptions(noSSHReuse)...)
+	args = append(args, src, dst)
+	return args
+}
+
+func runSSH(alias string, noSSHReuse bool, remoteArgs ...string) error {
+	return run("ssh", sshArgs(alias, noSSHReuse, remoteArgs...)...)
+}
+
+func outputSSH(alias string, noSSHReuse bool, remoteArgs ...string) (string, error) {
+	return output("ssh", sshArgs(alias, noSSHReuse, remoteArgs...)...)
+}
+
+func runSCP(noSSHReuse bool, src, dst string) error {
+	return run("scp", scpArgs(noSSHReuse, src, dst)...)
 }
 
 func needCmd(name string) {
@@ -193,22 +257,41 @@ func saveConfig(cfg Config) {
 }
 
 func initCmd(args []string) {
+	shortcutAlias, args := initShortcutAlias(args)
 	alias := arg(args, "--alias", "")
 	host := arg(args, "--host", "")
 	user := arg(args, "--user", "")
-	port := arg(args, "--port", "22")
-	remoteDir := arg(args, "--remote-dir", "")
-	remoteBase := arg(args, "--remote-base", "")
+	portArg := arg(args, "--port", "")
+	port := emptyText(portArg, "22")
 	identityFile := arg(args, "--identity-file", "")
 	runPrefix := arg(args, "--run-prefix", "")
 
-	if remoteDir == "" && remoteBase != "" {
-		cwd, _ := os.Getwd()
-		localName := filepath.Base(cwd)
-		remoteDir = strings.TrimRight(remoteBase, "/") + "/" + localName
+	usingSSHConfigHost := shortcutAlias != ""
+	var sshHost SSHConfigHost
+	if usingSSHConfigHost {
+		alias = shortcutAlias
+		var ok bool
+		sshHost, ok = loadSSHConfigHost(alias)
+		if !ok {
+			fmt.Printf("SSH host %q not found in ~/.ssh/config.\n", alias)
+			fmt.Println(`Use "sfa init --alias ... --host ... --user ..." or add it to ~/.ssh/config first.`)
+			os.Exit(1)
+		}
+		if host == "" {
+			host = emptyText(sshHost.HostName, alias)
+		}
+		if user == "" {
+			user = emptyText(sshHost.User, os.Getenv("USER"))
+		}
+		if portArg == "" && sshHost.Port != "" {
+			port = sshHost.Port
+		}
+		if identityFile == "" {
+			identityFile = expandHomePath(sshHost.IdentityFile)
+		}
 	}
 
-	if alias == "" || host == "" || user == "" || remoteDir == "" {
+	if alias == "" || host == "" || user == "" {
 		usage()
 		os.Exit(1)
 	}
@@ -217,14 +300,44 @@ func initCmd(args []string) {
 	needCmd("ssh-keygen")
 	needCmd("scp")
 
+	if usingSSHConfigHost && !testSSH(alias) {
+		fmt.Printf("SSH host %q exists, but key-based non-interactive login failed.\n", alias)
+		fmt.Println("Make sure this SSH config host can connect without a password prompt, or use the full sfa init --alias ... form to let sfa install a key.")
+		os.Exit(1)
+	}
+
+	remoteHomeValue := ""
+	if usingSSHConfigHost && arg(args, "--remote-dir", "") == "" && arg(args, "--remote-base", "") == "" {
+		var err error
+		remoteHomeValue, err = remoteHome(alias)
+		if err != nil {
+			fmt.Print(remoteHomeValue)
+			fmt.Println("Failed to resolve remote $HOME for", alias)
+			os.Exit(1)
+		}
+	}
+	remoteDir, err := resolveInitRemoteDir(args, remoteHomeValue)
+	if err != nil {
+		fmt.Println(err)
+		usage()
+		os.Exit(1)
+	}
+
 	keyPath := identityFile
-	if keyPath == "" {
+	if keyPath == "" && !usingSSHConfigHost {
 		keyPath = ensureKey(alias)
 	}
 
-	appendSSHConfig(alias, host, user, port, keyPath)
+	if !usingSSHConfigHost {
+		appendSSHConfig(alias, host, user, port, keyPath)
+	}
 
 	if !testSSH(alias) {
+		if usingSSHConfigHost {
+			fmt.Printf("SSH host %q exists, but key-based non-interactive login failed.\n", alias)
+			fmt.Println("Make sure this SSH config host can connect without a password prompt, or use the full sfa init --alias ... form to let sfa install a key.")
+			os.Exit(1)
+		}
 		if identityFile != "" {
 			fmt.Println("SSH key login failed with provided identity file.")
 			os.Exit(1)
@@ -260,6 +373,125 @@ func initCmd(args []string) {
 	helloTest(cfg)
 
 	fmt.Println("[ok] ssh-for-agents workspace initialized successfully.")
+}
+
+func initShortcutAlias(args []string) (string, []string) {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return "", args
+	}
+	return args[0], args[1:]
+}
+
+func loadSSHConfigHost(alias string) (SSHConfigHost, bool) {
+	configPath := filepath.Join(homeDir(), ".ssh", "config")
+	b, err := os.ReadFile(configPath)
+	if err != nil {
+		return SSHConfigHost{}, false
+	}
+	return parseSSHConfigHost(string(b), alias)
+}
+
+func parseSSHConfigHost(content, alias string) (SSHConfigHost, bool) {
+	host := SSHConfigHost{Alias: alias}
+	active := false
+	found := false
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := stripSSHConfigComment(scanner.Text())
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+
+		key := strings.ToLower(fields[0])
+		if key == "host" {
+			active = false
+			for _, pattern := range fields[1:] {
+				if pattern == alias {
+					active = true
+					found = true
+					break
+				}
+			}
+			continue
+		}
+
+		if !active {
+			continue
+		}
+
+		value := strings.TrimSpace(line[len(fields[0]):])
+		switch key {
+		case "hostname":
+			host.HostName = value
+		case "user":
+			host.User = value
+		case "port":
+			host.Port = value
+		case "identityfile":
+			host.IdentityFile = value
+		}
+	}
+
+	return host, found
+}
+
+func stripSSHConfigComment(line string) string {
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(line, "#") {
+		return ""
+	}
+	if i := strings.Index(line, " #"); i >= 0 {
+		return strings.TrimSpace(line[:i])
+	}
+	return line
+}
+
+func resolveInitRemoteDir(args []string, remoteHomeValue string) (string, error) {
+	remoteDir := arg(args, "--remote-dir", "")
+	remoteBase := arg(args, "--remote-base", "")
+	if remoteDir != "" {
+		return remoteDir, nil
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	localName := filepath.Base(cwd)
+	if remoteBase != "" {
+		return remoteJoin(remoteBase, localName), nil
+	}
+	if remoteHomeValue != "" {
+		return remoteJoin(remoteHomeValue, localName), nil
+	}
+	return "", fmt.Errorf("missing remote directory: use --remote-dir DIR or --remote-base DIR")
+}
+
+func remoteJoin(base, name string) string {
+	return strings.TrimRight(base, "/") + "/" + name
+}
+
+func remoteHome(alias string) (string, error) {
+	out, err := output("ssh", alias, "sh -lc "+quote(`printf %s "$HOME"`))
+	return strings.TrimSpace(out), err
+}
+
+func expandHomePath(path string) string {
+	if path == "" {
+		return ""
+	}
+	if path == "~" {
+		return homeDir()
+	}
+	if strings.HasPrefix(path, "~/") {
+		return filepath.Join(homeDir(), path[2:])
+	}
+	return path
 }
 
 func ensureKey(alias string) string {
@@ -371,6 +603,7 @@ The remote directory is a runnable code mirror.
 
 Only code and project configuration files are synced.
 Runtime artifacts such as logs, outputs, checkpoints, pids, data, and datasets are not synchronized and do not need to match the local directory.
+Build output directories such as bin and obj are not synchronized.
 Environment files such as .env and .env.* are not synchronized.
 
 Runtime:
@@ -672,38 +905,45 @@ echo "pwd=$(pwd)"`
 
 func syncCmd(args []string) {
 	cfg := loadConfig()
+	noSSHReuse := hasFlag(args, "--no-ssh-reuse")
+	args = removeFlag(args, "--no-ssh-reuse")
 	files, err := selectSyncFiles(args)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	n := syncFilesToRemote(cfg, files)
+	var n int
+	if len(args) == 0 {
+		n = syncArchiveToRemote(cfg, files, noSSHReuse)
+	} else {
+		n = syncFilesToRemote(cfg, files, noSSHReuse)
+	}
 	fmt.Printf("[ok] synced %d files to remote code mirror.\n", n)
 }
 
 func runCmd(args []string) {
-	syncFirst, cmd, ok := parseRunArgs(args)
+	opts, ok := parseRunArgsWithOptions(args)
 	if !ok {
-		fmt.Println(`Usage: sfa run [--sync] "COMMAND"`)
+		fmt.Println(`Usage: sfa run [--sync] [--no-ssh-reuse] "COMMAND"`)
 		os.Exit(1)
 	}
 	cfg := loadConfig()
-	if syncFirst {
-		syncToRemote(cfg)
+	if opts.SyncFirst {
+		syncToRemote(cfg, opts.NoSSHReuse)
 	}
-	remoteRun(cfg, cmd)
+	remoteRun(cfg, opts.Command)
 }
 
 func bgRunCmd(args []string) {
-	syncFirst, job, cmd, ok := parseBgRunArgs(args)
+	opts, ok := parseBgRunArgsWithOptions(args)
 	if !ok {
-		fmt.Println(`Usage: sfa bg-run [--sync] JOB "COMMAND"`)
+		fmt.Println(`Usage: sfa bg-run [--sync] [--no-ssh-reuse] JOB "COMMAND"`)
 		os.Exit(1)
 	}
 
 	cfg := loadConfig()
-	if syncFirst {
-		syncToRemote(cfg)
+	if opts.SyncFirst {
+		syncToRemote(cfg, opts.NoSSHReuse)
 	}
 
 	script := fmt.Sprintf(`cd %s
@@ -715,51 +955,87 @@ echo "Started background job: %s"
 echo "PID file: pids/%s.pid"
 echo "Log file: logs/%s.log"`,
 		quote(cfg.RemoteDir),
-		quote(withPrefix(cfg, cmd)),
-		job,
-		job,
-		job,
-		job,
-		job,
+		quote(withPrefix(cfg, opts.Command)),
+		opts.Job,
+		opts.Job,
+		opts.Job,
+		opts.Job,
+		opts.Job,
 	)
 
 	must(run("ssh", cfg.Alias, "sh -lc "+quote(script)))
 }
 
+type RunOptions struct {
+	SyncFirst  bool
+	NoSSHReuse bool
+	Command    string
+}
+
+type BgRunOptions struct {
+	SyncFirst  bool
+	NoSSHReuse bool
+	Job        string
+	Command    string
+}
+
 func parseRunArgs(args []string) (bool, string, bool) {
+	opts, ok := parseRunArgsWithOptions(args)
+	return opts.SyncFirst, opts.Command, ok
+}
+
+func parseRunArgsWithOptions(args []string) (RunOptions, bool) {
 	if len(args) < 1 {
-		return false, "", false
+		return RunOptions{}, false
 	}
 
-	syncFirst := false
-	if args[0] == "--sync" {
-		syncFirst = true
-		args = args[1:]
-	}
+	opts := RunOptions{}
+	args = consumeRunFlags(args, &opts.SyncFirst, &opts.NoSSHReuse)
 
 	if len(args) < 1 {
-		return syncFirst, "", false
+		return opts, false
 	}
 
-	return syncFirst, strings.Join(args, " "), true
+	opts.Command = strings.Join(args, " ")
+	return opts, true
 }
 
 func parseBgRunArgs(args []string) (bool, string, string, bool) {
+	opts, ok := parseBgRunArgsWithOptions(args)
+	return opts.SyncFirst, opts.Job, opts.Command, ok
+}
+
+func parseBgRunArgsWithOptions(args []string) (BgRunOptions, bool) {
 	if len(args) < 1 {
-		return false, "", "", false
+		return BgRunOptions{}, false
 	}
 
-	syncFirst := false
-	if args[0] == "--sync" {
-		syncFirst = true
-		args = args[1:]
-	}
+	opts := BgRunOptions{}
+	args = consumeRunFlags(args, &opts.SyncFirst, &opts.NoSSHReuse)
 
 	if len(args) < 2 {
-		return syncFirst, "", "", false
+		return opts, false
 	}
 
-	return syncFirst, args[0], strings.Join(args[1:], " "), true
+	opts.Job = args[0]
+	opts.Command = strings.Join(args[1:], " ")
+	return opts, true
+}
+
+func consumeRunFlags(args []string, syncFirst, noSSHReuse *bool) []string {
+	for len(args) > 0 {
+		switch args[0] {
+		case "--sync":
+			*syncFirst = true
+			args = args[1:]
+		case "--no-ssh-reuse":
+			*noSSHReuse = true
+			args = args[1:]
+		default:
+			return args
+		}
+	}
+	return args
 }
 
 func logCmd(args []string) {
@@ -1026,10 +1302,12 @@ func envClearCmd() {
 
 func pullCmd(args []string) {
 	cfg := loadConfig()
+	noSSHReuse := hasFlag(args, "--no-ssh-reuse")
+	args = removeFlag(args, "--no-ssh-reuse")
 
 	var remoteFiles []string
 	if len(args) == 0 {
-		remoteFiles = remoteListFiles(cfg)
+		remoteFiles = remoteListFiles(cfg, noSSHReuse)
 	}
 	files, err := selectPullFiles(args, remoteFiles)
 	if err != nil {
@@ -1044,18 +1322,18 @@ func pullCmd(args []string) {
 	}
 	fmt.Println("Local files with the same paths may be overwritten.")
 	fmt.Println()
-	fmt.Println("It will NOT pull logs, outputs, checkpoints, pids, data, datasets, .env files, .agent, .codex, .claude, SFA.md, or legacy agent docs.")
+	fmt.Println("It will NOT pull logs, outputs, checkpoints, pids, data, datasets, bin, obj, .env files, .agent, .codex, .claude, SFA.md, or legacy agent docs.")
 	fmt.Println()
 	if !confirm("Continue? [y/N] ") {
 		fmt.Println("Cancelled.")
 		return
 	}
 
-	n := pullFilesFromRemote(cfg, files)
+	n := pullFilesFromRemote(cfg, files, noSSHReuse)
 	fmt.Printf("[ok] pulled %d files from remote code mirror.\n", n)
 }
 
-func pullFilesFromRemote(cfg Config, files []string) int {
+func pullFilesFromRemote(cfg Config, files []string, noSSHReuse bool) int {
 	for _, rel := range files {
 		rel = strings.TrimPrefix(rel, "./")
 		localPath := filepath.FromSlash(rel)
@@ -1064,7 +1342,7 @@ func pullFilesFromRemote(cfg Config, files []string) int {
 			must(os.MkdirAll(parent, 0755))
 		}
 		remotePath := strings.TrimRight(cfg.RemoteDir, "/") + "/" + filepath.ToSlash(rel)
-		must(run("scp", cfg.Alias+":"+remotePath, localPath))
+		must(runSCP(noSSHReuse, cfg.Alias+":"+remotePath, localPath))
 	}
 
 	return len(files)
@@ -1133,6 +1411,7 @@ func cleanCodeCmd() {
 	fmt.Println("  - checkpoints/")
 	fmt.Println("  - data/")
 	fmt.Println("  - datasets/")
+	fmt.Println("  - bin/ and obj/")
 	fmt.Println("  - SSH config, SSH keys, or unrelated remote files")
 	fmt.Println()
 
@@ -1149,11 +1428,11 @@ func cleanCodeCmd() {
 		_ = os.RemoveAll(d)
 	}
 
-	remoteFiles := remoteListFiles(cfg)
+	remoteFiles := remoteListFiles(cfg, false)
 	for _, rel := range remoteFiles {
 		rel = strings.TrimPrefix(rel, "./")
 		remotePath := strings.TrimRight(cfg.RemoteDir, "/") + "/" + filepath.ToSlash(rel)
-		must(run("ssh", cfg.Alias, "rm -f "+quote(remotePath)))
+		must(runSSH(cfg.Alias, false, "rm -f "+quote(remotePath)))
 	}
 
 	remoteClean := fmt.Sprintf("rm -rf %s %s %s",
@@ -1161,7 +1440,7 @@ func cleanCodeCmd() {
 		quote(strings.TrimRight(cfg.RemoteDir, "/")+"/outputs"),
 		quote(strings.TrimRight(cfg.RemoteDir, "/")+"/pids"),
 	)
-	must(run("ssh", cfg.Alias, remoteClean))
+	must(runSSH(cfg.Alias, false, remoteClean))
 
 	fmt.Printf("[ok] removed %d local files and %d remote files, plus logs/ outputs/ pids/.\n", len(localFiles), len(remoteFiles))
 }
@@ -1533,22 +1812,104 @@ func removeInstallFiles() {
 	}
 }
 
-func syncToRemote(cfg Config) int {
+func syncToRemote(cfg Config, noSSHReuse bool) int {
 	files, err := selectSyncFiles(nil)
 	must(err)
-	return syncFilesToRemote(cfg, files)
+	return syncArchiveToRemote(cfg, files, noSSHReuse)
 }
 
-func syncFilesToRemote(cfg Config, files []string) int {
+func syncFilesToRemote(cfg Config, files []string, noSSHReuse bool) int {
 	for _, rel := range files {
 		local := rel
 		remotePath := strings.TrimRight(cfg.RemoteDir, "/") + "/" + filepath.ToSlash(rel)
 		remoteParent := pathDir(remotePath)
 
-		must(run("ssh", cfg.Alias, "mkdir -p "+quote(remoteParent)))
-		must(run("scp", local, cfg.Alias+":"+remotePath))
+		must(runSSH(cfg.Alias, noSSHReuse, "mkdir -p "+quote(remoteParent)))
+		must(runSCP(noSSHReuse, local, cfg.Alias+":"+remotePath))
 	}
 	return len(files)
+}
+
+func syncArchiveToRemote(cfg Config, files []string, noSSHReuse bool) int {
+	if len(files) == 0 {
+		return 0
+	}
+	if !remoteHasTar(cfg, noSSHReuse) {
+		fmt.Println("[warn] remote tar command not found; falling back to per-file scp sync.")
+		return syncFilesToRemote(cfg, files, noSSHReuse)
+	}
+
+	archivePath, err := makeSyncArchive(files)
+	must(err)
+	defer os.Remove(archivePath)
+
+	remoteArchive := fmt.Sprintf("/tmp/sfa-sync-%d.tar.gz", time.Now().UnixNano())
+	must(runSSH(cfg.Alias, noSSHReuse, "mkdir -p "+quote(cfg.RemoteDir)))
+	must(runSCP(noSSHReuse, archivePath, cfg.Alias+":"+remoteArchive))
+
+	script := fmt.Sprintf(
+		"mkdir -p %s && tar -xzf %s -C %s && rm -f %s",
+		quote(cfg.RemoteDir),
+		quote(remoteArchive),
+		quote(cfg.RemoteDir),
+		quote(remoteArchive),
+	)
+	must(runSSH(cfg.Alias, noSSHReuse, "sh -lc "+quote(script)))
+	return len(files)
+}
+
+func remoteHasTar(cfg Config, noSSHReuse bool) bool {
+	_, err := outputSSH(cfg.Alias, noSSHReuse, "command -v tar >/dev/null 2>&1")
+	return err == nil
+}
+
+func makeSyncArchive(files []string) (string, error) {
+	tmp, err := os.CreateTemp("", "sfa-sync-*.tar.gz")
+	if err != nil {
+		return "", err
+	}
+	defer tmp.Close()
+
+	gz := gzip.NewWriter(tmp)
+	defer gz.Close()
+
+	tw := tar.NewWriter(gz)
+	defer tw.Close()
+
+	for _, rel := range files {
+		localPath := filepath.FromSlash(rel)
+		info, err := os.Stat(localPath)
+		if err != nil {
+			return "", err
+		}
+		if info.IsDir() {
+			continue
+		}
+
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return "", err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		hdr.Mode = int64(info.Mode().Perm())
+		if err := tw.WriteHeader(hdr); err != nil {
+			return "", err
+		}
+
+		f, err := os.Open(localPath)
+		if err != nil {
+			return "", err
+		}
+		if _, err := io.Copy(tw, f); err != nil {
+			f.Close()
+			return "", err
+		}
+		if err := f.Close(); err != nil {
+			return "", err
+		}
+	}
+
+	return tmp.Name(), nil
 }
 
 func selectSyncFiles(args []string) ([]string, error) {
@@ -1609,13 +1970,13 @@ func validateSyncFile(arg string) (string, error) {
 	return filepath.FromSlash(rel), nil
 }
 
-func remoteListFiles(cfg Config) []string {
+func remoteListFiles(cfg Config, noSSHReuse bool) []string {
 	findCmd := fmt.Sprintf(
 		`cd %s && find . -type f -print`,
 		quote(cfg.RemoteDir),
 	)
 
-	out, err := output("ssh", cfg.Alias, "sh -lc "+quote(findCmd))
+	out, err := outputSSH(cfg.Alias, noSSHReuse, "sh -lc "+quote(findCmd))
 	if err != nil {
 		fmt.Print(out)
 		must(err)
@@ -1677,6 +2038,8 @@ func excludedDir(p string) bool {
 		".git",
 		".venv",
 		"__pycache__",
+		"bin",
+		"obj",
 		"logs",
 		"outputs",
 		"checkpoints",
